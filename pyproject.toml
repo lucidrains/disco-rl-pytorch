@@ -26,11 +26,10 @@ classifiers=[
 dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
-    "pi-zero-pytorch>=0.5.11",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.29",
-    "value-network>=0.0.38",
-    "x-transformers"
+    "torch-einops-utils>=0.1.2",
+    "x-mlps-pytorch",
+    "x-transformers",
 ]
 
 [project.urls]

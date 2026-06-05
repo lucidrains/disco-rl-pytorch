@@ -164,7 +164,7 @@ class SharedMetaEmbed(Module):
             num_actions +              # action dist
             dim_abstract_action +      # encoded actions
             dim_abstract_observation + # encoded observation
-            + 1                        # pred q value
+            1                          # pred q value
         )
 
         self.to_embed = create_mlp(dim, dim_in = dim_in, depth = mlp_depth)
@@ -219,6 +219,8 @@ class MetaNetwork(Module):
         time_backwards_shared_embed = shared_meta_embed.flip(dims = (1,))
 
         rnn_encoded, _ = self.rnn(time_backwards_shared_embed)
+
+        rnn_encoded = rnn_encoded.flip(dims = (1,))
 
         target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms, (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
 

@@ -7,6 +7,6 @@ def test_disco_rl():
 
     states = torch.randn(7, 8)
 
-    actions, action_logits, encoded_observations, encoded_actions = model(states, sample = True)
+    action_logits, encoded_observations, actions, encoded_actions, pred_action_value, pred_next_action = model(states, sample = True)
 
     assert actions.shape == (7,)

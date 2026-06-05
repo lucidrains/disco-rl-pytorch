@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import namedtuple
 
 import torch
 from torch import nn, cat
@@ -7,6 +8,17 @@ from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
 from x_transformers import Decoder, Encoder
+
+# constants
+
+PolicyOutput = namedtuple('PolicyOutput', (
+    'action_logits',
+    'encoded_observations',
+    'actions',
+    'sampled_actions',
+    'pred_action_value',
+    'pred_next_action_logits'
+), defaults = (None,) * 4)
 
 # functions
 
@@ -53,9 +65,9 @@ class Policy(Module):
             depth = depth
         )
 
-        self.norms = ModuleList([RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)])
+        self.meta_head_norms = ModuleList([RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)])
 
-        # heads
+        # meta learned output heads
         # 1. actions, main policy
         # 2. encoding for observation y(s)
         # 3. encoding for observation + actions z(s, a)
@@ -66,6 +78,14 @@ class Policy(Module):
 
         self.to_encoded_action = MLP(dim + num_actions, dim * 2, dim_abstract_observation)
 
+        # prediction heads
+
+        self.output_norms = ModuleList([RMSNorm(dim), RMSNorm(dim)])
+
+        self.to_action_value = MLP(dim + num_actions, dim * 2, 1)
+
+        self.to_next_action_pred = MLP(dim + num_actions, dim * 2, num_actions)
+
     def forward(
         self,
         state,
@@ -73,7 +93,7 @@ class Policy(Module):
     ):
         embed = self.to_embed(state)
 
-        action_logit_input, encoded_observation_input, encoded_action_input = (norm(embed) for norm in self.norms)
+        action_logit_input, encoded_observation_input, encoded_action_input = (norm(embed) for norm in self.meta_head_norms)
 
         action_logits = self.to_action_logits(action_logit_input)
 
@@ -83,14 +103,29 @@ class Policy(Module):
             action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
             return self.to_encoded_action((encoded_action_input, action_one_hot))
 
+        def get_pred(action):
+            action_value_input, next_action_pred_input = (norm(embed) for norm in self.output_norms)
+            action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
+
+            pred_action_value = self.to_action_value((action_value_input, action_one_hot))
+            pred_next_action_logits = self.to_next_action_pred((next_action_pred_input, action_one_hot))
+
+            return pred_action_value, pred_next_action_logits
+
         if not sample:
-            return action_logits, encoded_observations, get_encoded_action
+            return PolicyOutput(action_logits, encoded_observations, get_encoded_action)
+
+        # sample action
 
         sampled_action = gumbel_sample(action_logits)
 
+        # get the heads that depend on sampled action
+
         encoded_actions = get_encoded_action(sampled_action)
 
-        return sampled_action, action_logits, encoded_observations, encoded_actions
+        pred_action_value, pred_next_action_logits = get_pred(sampled_action)
+
+        return PolicyOutput(action_logits, encoded_observations, sampled_action, encoded_actions, pred_action_value, pred_next_action_logits)
 
 # main class
 

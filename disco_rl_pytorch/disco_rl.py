@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
 from einops import pack
+from einops.layers.torch import Reduce
 
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
 from x_transformers import Decoder, Encoder
@@ -235,9 +236,16 @@ class MetaRNN(Module):
         num_actions,
         dim_abstract_observation,
         dim_abstract_action,
-        lstm_kwargs: dict = dict()
+        lstm_kwargs: dict = dict(),
+        encoder_pool_kwargs: dict = dict()
     ):
         super().__init__()
+
+        self.experience_pool = Sequential(
+            Encoder(dim = dim, depth = 2, **encoder_pool_kwargs),
+            Reduce('b t d -> 1 1 d', 'mean')
+        )
+
         self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
 
     def forward(
@@ -245,6 +253,8 @@ class MetaRNN(Module):
         shared_meta_embed,
         hiddens = None
     ):
+        shared_meta_embed = self.experience_pool(shared_meta_embed)
+
         return self.rnn(shared_meta_embed, hiddens)
 
 # main class

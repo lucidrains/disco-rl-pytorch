@@ -6,6 +6,8 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
+from einops import pack
+
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
 from x_transformers import Decoder, Encoder
 
@@ -126,6 +128,52 @@ class Policy(Module):
         pred_action_value, pred_next_action_logits = get_pred(sampled_action)
 
         return PolicyOutput(action_logits, encoded_observations, sampled_action, encoded_actions, pred_action_value, pred_next_action_logits)
+
+# meta network(s) related
+
+class SharedMetaEmbed(Module):
+    def __init__(
+        self,
+        dim,
+        num_actions,
+        dim_abstract_observation,
+        dim_abstract_action,
+        mlp_depth = 2,
+        mlp_expansion = 2.,
+    ):
+        super().__init__()
+
+        dim_in = (
+            num_actions + 2 +          # one hot actions, rewards, terminated
+            num_actions +              # action dist
+            dim_abstract_action +      # encoded actions
+            dim_abstract_observation + # encoded observation
+            + 1                        # pred q value
+        )
+
+        self.to_embed = create_mlp(dim, dim_in = dim_in, depth = mlp_depth)
+        self.num_actions = num_actions
+
+    def forward(
+        self,
+        actions,
+        rewards,
+        terminated,
+        action_logits,
+        encoded_observations,
+        encoded_actions,
+        pred_action_value
+    ):
+
+        actions_one_hot = F.one_hot(actions, self.num_actions)
+
+        action_dist = action_logits.softmax(dim = -1)
+
+        concatted_inputs, _ = pack((actions_one_hot, rewards, terminated.float(), action_dist, encoded_actions, encoded_observations, pred_action_value), 'b t *')
+
+        embeds = self.to_embed(concatted_inputs)
+
+        return embeds
 
 # main class
 

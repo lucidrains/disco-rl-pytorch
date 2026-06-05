@@ -1,7 +1,9 @@
 
+import torch
+import torch.nn.functional as F
+
 def test_disco_rl():
-    import torch
-    from disco_rl_pytorch.disco_rl import Policy, SharedMetaEmbed
+    from disco_rl_pytorch.disco_rl import Policy, SharedMetaEmbed, MetaNetwork, MetaRNN, forward_kl
 
     model = Policy(dim = 32, dim_state = 8, num_actions = 4, depth = 2)
 
@@ -16,4 +18,23 @@ def test_disco_rl():
 
     embedder = SharedMetaEmbed(dim = 32, num_actions = 4, dim_abstract_observation = 32, dim_abstract_action = 32)
 
-    embed = embedder(actions, rewards, terminated, action_logits, encoded_observations, encoded_actions, pred_action_value)
+    embeds = embedder(actions, rewards, terminated, action_logits, encoded_observations, encoded_actions, pred_action_value)
+
+    assert embeds.shape == (7, 20, 32)
+
+    meta_network = MetaNetwork(dim = 32, num_actions = 4, dim_abstract_action = 32, dim_abstract_observation = 32)
+
+    target_action_logits, target_encoded_observations, target_encoded_actions = meta_network(embeds)
+
+    loss = (
+        forward_kl(action_logits, target_action_logits) +
+        forward_kl(encoded_observations, target_encoded_observations) +
+        forward_kl(encoded_actions, target_encoded_actions)
+    )
+
+    assert loss.numel() == 1
+
+    meta_rnn = MetaRNN(dim = 32, num_actions = 4, dim_abstract_action = 32, dim_abstract_observation = 32)
+
+    embeds, hiddens = meta_rnn(embeds)
+    embeds, hiddens = meta_rnn(embeds)

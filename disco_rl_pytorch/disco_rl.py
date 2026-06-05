@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import partial
 from collections import namedtuple
 
 import torch
@@ -17,10 +18,18 @@ PolicyOutput = namedtuple('PolicyOutput', (
     'action_logits',
     'encoded_observations',
     'actions',
-    'sampled_actions',
+    'encoded_actions',
     'pred_action_value',
     'pred_next_action_logits'
 ), defaults = (None,) * 4)
+
+MetaNetworkOutput = namedtuple('MetaNetworkOutput', (
+    'target_action_logits',
+    'target_encoded_observations',
+    'target_encoded_actions',
+))
+
+LinearNoBias = partial(Linear, bias = False)
 
 # functions
 
@@ -41,6 +50,13 @@ def gumbel_noise(t):
 def gumbel_sample(t, dim = -1, keepdim = False):
     t = t + gumbel_noise(t)
     return t.argmax(dim = dim, keepdim = keepdim)
+
+# tensor helpers
+
+def forward_kl(logits, target_logits, reduction = 'batchmean'):
+    log_probs = logits.log_softmax(dim = -1)
+    target_prob = target_logits.softmax(dim = -1)
+    return F.kl_div(log_probs, target_prob, reduction = reduction)
 
 # classes
 
@@ -74,7 +90,7 @@ class Policy(Module):
         # 2. encoding for observation y(s)
         # 3. encoding for observation + actions z(s, a)
 
-        self.to_action_logits = Linear(dim, num_actions, bias = False)
+        self.to_action_logits = LinearNoBias(dim, num_actions)
 
         self.to_encoded_observation = MLP(dim, dim * 2, dim_abstract_observation)
 
@@ -174,6 +190,60 @@ class SharedMetaEmbed(Module):
         embeds = self.to_embed(concatted_inputs)
 
         return embeds
+
+class MetaNetwork(Module):
+    def __init__(
+        self,
+        dim,
+        num_actions,
+        dim_abstract_observation,
+        dim_abstract_action,
+        lstm_kwargs: dict = dict()
+    ):
+        super().__init__()
+
+        self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
+
+        self.norms = ModuleList([nn.RMSNorm(dim), nn.RMSNorm(dim), nn.RMSNorm(dim)])
+
+        self.to_target_action_logits = LinearNoBias(dim, num_actions)
+
+        self.to_target_encoded_observation = LinearNoBias(dim, dim_abstract_observation)
+
+        self.to_target_encoded_action = LinearNoBias(dim, dim_abstract_action)
+
+    def forward(
+        self,
+        shared_meta_embed
+    ):
+        time_backwards_shared_embed = shared_meta_embed.flip(dims = (1,))
+
+        rnn_encoded, _ = self.rnn(time_backwards_shared_embed)
+
+        target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms, (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
+
+        output = MetaNetworkOutput(target_action_logits, target_encoded_observation, target_encoded_action)
+
+        return output
+
+class MetaRNN(Module):
+    def __init__(
+        self,
+        dim,
+        num_actions,
+        dim_abstract_observation,
+        dim_abstract_action,
+        lstm_kwargs: dict = dict()
+    ):
+        super().__init__()
+        self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
+
+    def forward(
+        self,
+        shared_meta_embed,
+        hiddens = None
+    ):
+        return self.rnn(shared_meta_embed, hiddens)
 
 # main class
 

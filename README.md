@@ -1,4 +1,6 @@
-# DiscoRL - Pytorch (wip)
+<img src="./fig1.png" width="500px"></img>
+
+## DiscoRL - Pytorch (wip)
 
 Implementation and explorations into [Discovering state-of-the-art reinforcement learning algorithms](https://www.nature.com/articles/s41586-025-09761-x) (DiscoRL), David Silver's last work at Deepmind.
 

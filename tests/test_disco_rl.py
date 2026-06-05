@@ -22,9 +22,17 @@ def test_disco_rl():
 
     assert embeds.shape == (7, 20, 32)
 
+    # meta rnn
+
+    meta_rnn = MetaRNN(dim = 32)
+
+    condition, hiddens = meta_rnn(embeds)
+
+    # meta network
+
     meta_network = MetaNetwork(dim = 32, num_actions = 4, dim_abstract_action = 32, dim_abstract_observation = 32)
 
-    target_action_logits, target_encoded_observations, target_encoded_actions = meta_network(embeds)
+    target_action_logits, target_encoded_observations, target_encoded_actions = meta_network(embeds, condition = condition)
 
     loss = (
         forward_kl(action_logits, target_action_logits) +
@@ -33,8 +41,3 @@ def test_disco_rl():
     )
 
     assert loss.numel() == 1
-
-    meta_rnn = MetaRNN(dim = 32, num_actions = 4, dim_abstract_action = 32, dim_abstract_observation = 32)
-
-    embeds, hiddens = meta_rnn(embeds)
-    embeds, hiddens = meta_rnn(embeds)

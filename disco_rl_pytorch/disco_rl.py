@@ -215,13 +215,18 @@ class MetaNetwork(Module):
 
     def forward(
         self,
-        shared_meta_embed
+        shared_meta_embed,
+        hidden = None,
+        condition = None
     ):
         time_backwards_shared_embed = shared_meta_embed.flip(dims = (1,))
 
-        rnn_encoded, _ = self.rnn(time_backwards_shared_embed)
+        rnn_encoded, _ = self.rnn(time_backwards_shared_embed, hidden)
 
         rnn_encoded = rnn_encoded.flip(dims = (1,))
+
+        if exists(condition):
+            rnn_encoded = rnn_encoded * condition
 
         target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms, (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
 
@@ -233,9 +238,6 @@ class MetaRNN(Module):
     def __init__(
         self,
         dim,
-        num_actions,
-        dim_abstract_observation,
-        dim_abstract_action,
         lstm_kwargs: dict = dict(),
         encoder_pool_kwargs: dict = dict()
     ):

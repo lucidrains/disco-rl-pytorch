@@ -10,12 +10,12 @@ def test_disco_rl(adaptive_loss_weight):
         SharedMetaEmbed,
         MetaNetwork,
         MetaRNN,
+        MetaValue,
         Policy,
         Population,
         Adam,
         forward_kl,
-        PolicyOutput,
-        MetaNetworkOutput
+        PolicyOutput
     )
 
     model = Policy(dim = 32, dim_state = 8, num_actions = 4, depth = 2)
@@ -69,3 +69,9 @@ def test_disco_rl(adaptive_loss_weight):
 
     assert next_params.keys() == params.keys()
     assert loss.numel() == 1
+
+    value_network = MetaValue(dim = 32, dim_state = 8, depth = 4)
+
+    values = value_network(states)
+
+    assert values.shape == (7, 20)

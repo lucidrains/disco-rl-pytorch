@@ -13,7 +13,7 @@ from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 from torch.autograd import grad as torch_grad
 from torch.func import vmap, grad, functional_call
 
-from einops import pack, repeat
+from einops import pack, rearrange, repeat
 from einops.layers.torch import Reduce
 
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
@@ -367,6 +367,29 @@ class MetaRNN(Module):
         shared_meta_embed = self.experience_pool(shared_meta_embed)
 
         return self.rnn(shared_meta_embed, hiddens)
+
+class MetaValue(Module):
+    def __init__(
+        self,
+        dim,
+        dim_state,
+        depth,
+    ):
+        super().__init__()
+
+        self.to_value = create_mlp(
+            dim,
+            dim_in = dim_state,
+            dim_out = 1,
+            depth = depth
+        )
+
+    def forward(
+        self,
+        state
+    ):
+        value = self.to_value(state)
+        return rearrange(value, '... 1 -> ...')
 
 # vectorized
 

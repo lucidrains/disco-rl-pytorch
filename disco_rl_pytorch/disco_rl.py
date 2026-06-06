@@ -306,6 +306,99 @@ class Population(Module):
         output = self.vmap_forward(params, state, kwargs)
         return output
 
+# vectorized adam
+
+class Adam(Module):
+    def __init__(
+        self,
+        lr = 5e-4,
+        betas = (0.9, 0.999),
+        eps = 1e-8
+    ):
+        super().__init__()
+        self.time = 0
+
+        self.betas = betas
+        self.eps = eps
+        self.lr = lr
+
+    def init_optim_states(
+        self,
+        params
+    ):
+        moment = {name: torch.zeros_like(t) for name, t in params.items()}
+        variance = {name: torch.zeros_like(t) for name, t in params.items()}
+        return moment, variance
+
+    def forward(
+        self,
+        optim_state,
+        loss,
+        params,
+    ):
+        self.time += 1
+
+        beta1, beta2, eps, lr, time = *self.betas, self.eps, self.lr, self.time
+
+        moments, variances = optim_state
+
+        # handle dictionary structure for grad
+
+        param_names = params.keys()
+
+        grad_values = torch_grad(
+            loss,
+            tuple(params.values()),
+            only_inputs = True,
+            create_graph= True,
+            retain_graph = True,
+            allow_unused = True
+        )
+
+        grads = dict(zip(param_names, grad_values))
+
+        # doing the gradient step, and meta learning through it
+
+        next_params = dict()
+        next_moments = dict()
+        next_variances = dict()
+
+        for name, grad in grads.items():
+            param = params[name]
+            device = param.device
+
+            if not exists(grad):
+                next_params[name] = param
+                next_moments[name] = moments[name]
+                next_variances[name] = variances[name]
+                continue
+
+            moment, variance = moments[name], variances[name]
+
+            # ema
+
+            next_moment = moment.lerp(grad, 1. - beta1)
+            next_variance = variance.lerp(grad ** 2, 1. - beta2)
+
+            # correction
+
+            unbiased_moment = next_moment / (1. - beta1 ** time)
+            unbiased_variance = next_variance / (1. - beta2 ** time)
+
+            # update params
+
+            update = unbiased_moment.div(unbiased_variance.sqrt().add(eps))
+
+            next_params[name] = param - update * lr
+
+            # save next moment and variance
+
+            next_moments[name] = next_moment
+            next_variances[name] = next_variance
+
+        next_optim_states = next_moments, next_variances
+        return next_optim_states, next_params
+
 # main class
 
 class DiscoRL(Module):

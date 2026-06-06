@@ -9,6 +9,7 @@ def test_disco_rl():
         MetaRNN,
         Policy,
         Population,
+        Adam,
         forward_kl
     )
 
@@ -51,4 +52,11 @@ def test_disco_rl():
         forward_kl(encoded_actions, target_encoded_actions)
     )
 
+    population_optimizer = Adam()
+
+    optim_states = population_optimizer.init_optim_states(params)
+
+    next_optim_states, next_params = population_optimizer(optim_states, loss, params)
+
+    assert next_params.keys() == params.keys()
     assert loss.numel() == 1

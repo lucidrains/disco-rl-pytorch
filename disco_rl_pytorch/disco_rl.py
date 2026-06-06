@@ -4,6 +4,7 @@ import math
 from functools import partial
 from collections import namedtuple
 
+import einx
 import torch
 import torch.nn.functional as F
 from torch import nn, cat, is_tensor
@@ -175,6 +176,33 @@ class Policy(Module):
 
         return PolicyOutput(action_logits, encoded_observations, sampled_action, encoded_actions, pred_action_value, pred_next_action_logits)
 
+# film
+
+class FiLM(Module):
+    def __init__(
+        self,
+        dim,
+        dim_cond
+    ):
+        super().__init__()
+        self.norm = RMSNorm(dim, elementwise_affine = False)
+
+        self.to_gamma_beta = Linear(dim_cond, dim * 2, bias = False)
+        torch.nn.init.zeros_(self.to_gamma_beta.weight)
+
+    def forward(
+        self,
+        tokens,
+        cond
+    ):
+        normed = self.norm(tokens)
+
+        gamma, beta = self.to_gamma_beta(cond).chunk(2, dim = -1)
+        gamma, beta = (t.expand_as(normed) for t in (gamma, beta))
+
+        scaled = einx.multiply('b n d, b n d', normed, gamma + 1.)
+        return einx.add('b n d, b n d', scaled, beta)
+
 # meta network(s) related
 
 class SharedMetaEmbed(Module):
@@ -231,13 +259,18 @@ class MetaNetwork(Module):
         lstm_kwargs: dict = dict(),
         adaptive_loss_weight = False,
         loss_weight_range = (1e-2, 10.),
+        dim_condition = None
     ):
         super().__init__()
 
         self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
 
-        self.adaptive_loss_weight = adaptive_loss_weight
-        self.loss_weight_range = loss_weight_range
+        # condition from forward meta-rnn
+
+        dim_condition = default(dim_condition, dim)
+        self.condition_film = FiLM(dim, dim_condition)
+
+        # norms and output heads
 
         num_norms = 4 if adaptive_loss_weight else 3
         self.norms = ModuleList([nn.RMSNorm(dim) for _ in range(num_norms)])
@@ -247,6 +280,11 @@ class MetaNetwork(Module):
         self.to_target_encoded_observation = LinearNoBias(dim, dim_abstract_observation)
 
         self.to_target_encoded_action = LinearNoBias(dim, dim_abstract_action)
+
+        # adaptive loss weight
+
+        self.adaptive_loss_weight = adaptive_loss_weight
+        self.loss_weight_range = loss_weight_range
 
         if adaptive_loss_weight:
             self.to_loss_weight_logits = LinearNoBias(dim, 3)
@@ -264,7 +302,7 @@ class MetaNetwork(Module):
         rnn_encoded = rnn_encoded.flip(dims = (1,))
 
         if exists(condition):
-            rnn_encoded = rnn_encoded * condition
+            rnn_encoded = self.condition_film(rnn_encoded, condition)
 
         target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms[:3], (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
 

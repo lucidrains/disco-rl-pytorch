@@ -1,8 +1,11 @@
+import pytest
+parametrize = pytest.mark.parametrize
 
 import torch
 import torch.nn.functional as F
 
-def test_disco_rl():
+@parametrize('adaptive_loss_weight', (True, False))
+def test_disco_rl(adaptive_loss_weight):
     from disco_rl_pytorch.disco_rl import (
         SharedMetaEmbed,
         MetaNetwork,
@@ -10,7 +13,9 @@ def test_disco_rl():
         Policy,
         Population,
         Adam,
-        forward_kl
+        forward_kl,
+        PolicyOutput,
+        MetaNetworkOutput
     )
 
     model = Policy(dim = 32, dim_state = 8, num_actions = 4, depth = 2)
@@ -42,15 +47,19 @@ def test_disco_rl():
 
     # meta network
 
-    meta_network = MetaNetwork(dim = 32, num_actions = 4, dim_abstract_action = 32, dim_abstract_observation = 32)
-
-    target_action_logits, target_encoded_observations, target_encoded_actions = meta_network(embeds, condition = condition)
-
-    loss = (
-        forward_kl(action_logits, target_action_logits) +
-        forward_kl(encoded_observations, target_encoded_observations) +
-        forward_kl(encoded_actions, target_encoded_actions)
+    meta_network = MetaNetwork(
+        dim = 32,
+        num_actions = 4,
+        dim_abstract_action = 32,
+        dim_abstract_observation = 32,
+        adaptive_loss_weight = adaptive_loss_weight
     )
+
+    meta_network_outputs = meta_network(embeds, condition = condition)
+
+    policy_outputs = PolicyOutput(action_logits, encoded_observations, actions, encoded_actions, pred_action_value, pred_next_action)
+
+    loss = meta_network.loss(policy_outputs, meta_network_outputs)
 
     population_optimizer = Adam()
 

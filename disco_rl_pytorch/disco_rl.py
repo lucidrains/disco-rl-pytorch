@@ -1,10 +1,12 @@
 from __future__ import annotations
+
+import math
 from functools import partial
 from collections import namedtuple
 
 import torch
-from torch import nn, cat
 import torch.nn.functional as F
+from torch import nn, cat, is_tensor
 from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
 from torch.autograd import grad as torch_grad
@@ -31,7 +33,8 @@ MetaNetworkOutput = namedtuple('MetaNetworkOutput', (
     'target_action_logits',
     'target_encoded_observations',
     'target_encoded_actions',
-))
+    'loss_weight'
+), defaults = (None,))
 
 LinearNoBias = partial(Linear, bias = False)
 
@@ -46,6 +49,9 @@ def default(v, d):
 # sampling
 
 def log(t, eps = 1e-20):
+    if not is_tensor(t):
+        return math.log(max(t, eps))
+
     return t.clamp_min(eps).log()
 
 def gumbel_noise(t):
@@ -57,10 +63,21 @@ def gumbel_sample(t, dim = -1, keepdim = False):
 
 # tensor helpers
 
-def forward_kl(logits, target_logits, reduction = 'batchmean'):
+def rescale(t, from_range, to_range, eps = 1e-6):
+    from_min, from_max = from_range
+    to_min, to_max = to_range
+    return (t - from_min) / max(from_max - from_min, eps) * (to_max - to_min) + to_min
+
+def forward_kl(logits, target_logits, weight = None):
     log_probs = logits.log_softmax(dim = -1)
     target_prob = target_logits.softmax(dim = -1)
-    return F.kl_div(log_probs, target_prob, reduction = reduction)
+
+    kl = F.kl_div(log_probs, target_prob, reduction = 'none').sum(dim = -1)
+
+    if exists(weight):
+        kl = kl * weight
+
+    return kl.mean()
 
 # classes
 
@@ -211,19 +228,28 @@ class MetaNetwork(Module):
         num_actions,
         dim_abstract_observation,
         dim_abstract_action,
-        lstm_kwargs: dict = dict()
+        lstm_kwargs: dict = dict(),
+        adaptive_loss_weight = False,
+        loss_weight_range = (1e-2, 10.),
     ):
         super().__init__()
 
         self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
 
-        self.norms = ModuleList([nn.RMSNorm(dim), nn.RMSNorm(dim), nn.RMSNorm(dim)])
+        self.adaptive_loss_weight = adaptive_loss_weight
+        self.loss_weight_range = loss_weight_range
+
+        num_norms = 4 if adaptive_loss_weight else 3
+        self.norms = ModuleList([nn.RMSNorm(dim) for _ in range(num_norms)])
 
         self.to_target_action_logits = LinearNoBias(dim, num_actions)
 
         self.to_target_encoded_observation = LinearNoBias(dim, dim_abstract_observation)
 
         self.to_target_encoded_action = LinearNoBias(dim, dim_abstract_action)
+
+        if adaptive_loss_weight:
+            self.to_loss_weight_logits = LinearNoBias(dim, 3)
 
     def forward(
         self,
@@ -240,11 +266,44 @@ class MetaNetwork(Module):
         if exists(condition):
             rnn_encoded = rnn_encoded * condition
 
-        target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms, (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
+        target_action_logits, target_encoded_observation, target_encoded_action = (fn(norm(rnn_encoded)) for norm, fn in zip(self.norms[:3], (self.to_target_action_logits, self.to_target_encoded_observation, self.to_target_encoded_action)))
 
-        output = MetaNetworkOutput(target_action_logits, target_encoded_observation, target_encoded_action)
+        loss_weight = None
+
+        if self.adaptive_loss_weight:
+            weight_logits = self.to_loss_weight_logits(self.norms[3](rnn_encoded))
+
+            log_loss_weight = rescale(
+                weight_logits.sigmoid(),
+                (0., 1.),
+                tuple(map(log, self.loss_weight_range))
+            )
+
+            loss_weight = log_loss_weight.exp()
+
+        output = MetaNetworkOutput(target_action_logits, target_encoded_observation, target_encoded_action, loss_weight)
 
         return output
+
+    def loss(
+        self,
+        preds: PolicyOutput,
+        targets: MetaNetworkOutput
+    ):
+        weight = targets.loss_weight
+
+        weight_action, weight_obs, weight_encoded_action = (None, None, None)
+
+        if exists(weight):
+            weight_action, weight_obs, weight_encoded_action = weight.unbind(dim = -1)
+
+        loss = (
+            forward_kl(preds.action_logits, targets.target_action_logits, weight = weight_action) +
+            forward_kl(preds.encoded_observations, targets.target_encoded_observations, weight = weight_obs) +
+            forward_kl(preds.encoded_actions, targets.target_encoded_actions, weight = weight_encoded_action)
+        )
+
+        return loss
 
 class MetaRNN(Module):
     def __init__(

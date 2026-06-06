@@ -7,7 +7,10 @@ from torch import nn, cat
 import torch.nn.functional as F
 from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
-from einops import pack
+from torch.autograd import grad as torch_grad
+from torch.func import vmap, grad, functional_call
+
+from einops import pack, repeat
 from einops.layers.torch import Reduce
 
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
@@ -105,6 +108,28 @@ class Policy(Module):
 
         self.to_next_action_pred = MLP(dim + num_actions, dim * 2, num_actions)
 
+    def get_encoded_action(
+        self,
+        embed,
+        action
+    ):
+        encoded_action_input = self.meta_head_norms[-1](embed)
+        action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
+        return self.to_encoded_action((encoded_action_input, action_one_hot))
+
+    def get_pred(
+        self,
+        embed,
+        action
+    ):
+        action_value_input, next_action_pred_input = (norm(embed) for norm in self.output_norms)
+        action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
+
+        pred_action_value = self.to_action_value((action_value_input, action_one_hot))
+        pred_next_action_logits = self.to_next_action_pred((next_action_pred_input, action_one_hot))
+
+        return pred_action_value, pred_next_action_logits
+
     def forward(
         self,
         state,
@@ -112,27 +137,14 @@ class Policy(Module):
     ):
         embed = self.to_embed(state)
 
-        action_logit_input, encoded_observation_input, encoded_action_input = (norm(embed) for norm in self.meta_head_norms)
+        action_logit_input, encoded_observation_input = (norm(embed) for norm in self.meta_head_norms[:2])
 
         action_logits = self.to_action_logits(action_logit_input)
 
         encoded_observations = self.to_encoded_observation(encoded_observation_input)
 
-        def get_encoded_action(action):
-            action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
-            return self.to_encoded_action((encoded_action_input, action_one_hot))
-
-        def get_pred(action):
-            action_value_input, next_action_pred_input = (norm(embed) for norm in self.output_norms)
-            action_one_hot = F.one_hot(action, num_classes = self.num_actions).float()
-
-            pred_action_value = self.to_action_value((action_value_input, action_one_hot))
-            pred_next_action_logits = self.to_next_action_pred((next_action_pred_input, action_one_hot))
-
-            return pred_action_value, pred_next_action_logits
-
         if not sample:
-            return PolicyOutput(action_logits, encoded_observations, get_encoded_action)
+            return action_logits, encoded_observations
 
         # sample action
 
@@ -140,9 +152,9 @@ class Policy(Module):
 
         # get the heads that depend on sampled action
 
-        encoded_actions = get_encoded_action(sampled_action)
+        encoded_actions = self.get_encoded_action(embed, sampled_action)
 
-        pred_action_value, pred_next_action_logits = get_pred(sampled_action)
+        pred_action_value, pred_next_action_logits = self.get_pred(embed, sampled_action)
 
         return PolicyOutput(action_logits, encoded_observations, sampled_action, encoded_actions, pred_action_value, pred_next_action_logits)
 
@@ -258,6 +270,41 @@ class MetaRNN(Module):
         shared_meta_embed = self.experience_pool(shared_meta_embed)
 
         return self.rnn(shared_meta_embed, hiddens)
+
+# vectorized
+
+class Population(Module):
+    def __init__(
+        self,
+        model: Module
+    ):
+        super().__init__()
+
+        self.model = model
+
+        def forward(params, state, kwargs):
+            return functional_call(model, params, state, kwargs = kwargs)
+
+        self.vmap_forward = vmap(forward, in_dims = (0, 0, None), out_dims = 0, randomness = 'different')
+
+    def init_params(self, batch):
+        params = self.model.named_parameters()
+        return {name: repeat(t, '... -> b ...', b = batch) for name, t in params}
+
+    def forward(
+        self,
+        state,
+        params = None,
+        **kwargs
+    ):
+        batch = state.shape[0]
+
+        if not exists(params):
+            batch = state.shape[0]
+            params = self.init_params(batch)
+
+        output = self.vmap_forward(params, state, kwargs)
+        return output
 
 # main class
 

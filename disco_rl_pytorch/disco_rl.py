@@ -39,6 +39,18 @@ MetaNetworkOutput = namedtuple('MetaNetworkOutput', (
     'loss_weight'
 ), defaults = (None,))
 
+DiscoRLOutput = namedtuple('DiscoRLOutput', (
+    'target_action_logits',
+    'values',
+    'loss_weights'
+), defaults = (None,))
+
+AdamState = namedtuple('AdamState', (
+    'time',
+    'moments',
+    'variances'
+))
+
 LinearNoBias = partial(Linear, bias = False)
 
 # functions
@@ -48,6 +60,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 # sampling
 
@@ -65,6 +80,9 @@ def gumbel_sample(t, dim = -1, keepdim = False):
     return t.argmax(dim = dim, keepdim = keepdim)
 
 # tensor helpers
+
+def detach_tree(t):
+    return tree_map_tensor(lambda t: t.detach(), t)
 
 def rescale(t, from_range, to_range, eps = 1e-6):
     from_min, from_max = from_range
@@ -153,8 +171,11 @@ class Policy(Module):
     def forward(
         self,
         state,
+        actions = None,
         sample = False
     ):
+        assert not (sample and exists(actions))
+
         embed = self.to_embed(state)
 
         action_logit_input, encoded_observation_input = (norm(embed) for norm in self.meta_head_norms[:2])
@@ -163,20 +184,23 @@ class Policy(Module):
 
         encoded_observations = self.to_encoded_observation(encoded_observation_input)
 
-        if not sample:
+        if not sample and not exists(actions):
             return action_logits, encoded_observations
 
-        # sample action
+        # action given or sample action
 
-        sampled_action = gumbel_sample(action_logits)
+        if exists(actions):
+            action = actions
+        else:
+            action = gumbel_sample(action_logits)
 
         # get the heads that depend on sampled action
 
-        encoded_actions = self.get_encoded_action(embed, sampled_action)
+        encoded_actions = self.get_encoded_action(embed, action)
 
-        pred_action_value, pred_next_action_logits = self.get_pred(embed, sampled_action)
+        pred_action_value, pred_next_action_logits = self.get_pred(embed, action)
 
-        return PolicyOutput(action_logits, encoded_observations, sampled_action, encoded_actions, pred_action_value, pred_next_action_logits)
+        return PolicyOutput(action_logits, encoded_observations, action, encoded_actions, pred_action_value, pred_next_action_logits)
 
 # film
 
@@ -407,7 +431,11 @@ class Population(Module):
         def forward(params, state, kwargs):
             return functional_call(model, params, state, kwargs = kwargs)
 
+        def forward_with_actions(params, state, actions, kwargs):
+            return functional_call(model, params, state, kwargs = {**kwargs, 'actions': actions})
+
         self.vmap_forward = vmap(forward, in_dims = (0, 0, None), out_dims = 0, randomness = 'different')
+        self.vmap_forward_with_actions = vmap(forward_with_actions, in_dims = (0, 0, 0, None), out_dims = 0, randomness = 'different')
 
     def init_params(self, batch):
         params = self.model.named_parameters()
@@ -417,16 +445,17 @@ class Population(Module):
         self,
         state,
         params = None,
+        actions = None,
         **kwargs
     ):
         batch = state.shape[0]
 
-        if not exists(params):
-            batch = state.shape[0]
-            params = self.init_params(batch)
+        params = params if exists(params) else self.init_params(batch)
 
-        output = self.vmap_forward(params, state, kwargs)
-        return output
+        if exists(actions):
+            return self.vmap_forward_with_actions(params, state, actions, kwargs)
+
+        return self.vmap_forward(params, state, kwargs)
 
 # vectorized adam
 
@@ -438,7 +467,6 @@ class Adam(Module):
         eps = 1e-8
     ):
         super().__init__()
-        self.time = 0
 
         self.betas = betas
         self.eps = eps
@@ -450,7 +478,7 @@ class Adam(Module):
     ):
         moment = {name: torch.zeros_like(t) for name, t in params.items()}
         variance = {name: torch.zeros_like(t) for name, t in params.items()}
-        return moment, variance
+        return AdamState(0, moment, variance)
 
     def forward(
         self,
@@ -459,11 +487,11 @@ class Adam(Module):
         params,
         detach_grads = False
     ):
-        self.time += 1
+        time, moments, variances = optim_state
+        time += 1
 
-        beta1, beta2, eps, lr, time = *self.betas, self.eps, self.lr, self.time
-
-        moments, variances = optim_state
+        beta1, beta2 = self.betas
+        eps, lr = self.eps, self.lr
 
         # handle dictionary structure for grad
 
@@ -481,7 +509,7 @@ class Adam(Module):
         # maybe detach, for TBPTT
 
         if detach_grads:
-            grad_values = tree_map_tensor(lambda t: t.detach(), grad_values)
+            grad_values = detach_tree(grad_values)
 
         # back to dict[str, Tensor]
 
@@ -495,7 +523,6 @@ class Adam(Module):
 
         for name, grad in grads.items():
             param = params[name]
-            device = param.device
 
             if not exists(grad):
                 next_params[name] = param
@@ -526,7 +553,7 @@ class Adam(Module):
             next_moments[name] = next_moment
             next_variances[name] = next_variance
 
-        next_optim_states = next_moments, next_variances
+        next_optim_states = AdamState(time, next_moments, next_variances)
         return next_optim_states, next_params
 
 # main class
@@ -536,18 +563,26 @@ class DiscoRL(Module):
         self,
         policy: Policy | Module,
         policy_optimizer: Adam | Module,
+        shared_meta_embed: SharedMetaEmbed | Module,
         meta_rnn: MetaRNN | Module,
         meta_network: MetaNetwork | Module,
         meta_value_network: MetaValue | Module,
+        update_steps = 10,
+        detach_every = 0,
     ):
         super().__init__()
 
         self.policy = policy
         self.policy_optimizer = policy_optimizer
+        self.shared_meta_embed = shared_meta_embed
 
         self.meta_rnn = meta_rnn
         self.meta_network = meta_network
         self.meta_value_network = meta_value_network
+
+        self.update_steps = update_steps
+        self.detach_every = detach_every
+        self.should_detach = detach_every > 0
 
     def forward(
         self,
@@ -555,6 +590,66 @@ class DiscoRL(Module):
         actions,
         rewards,
         terminated,
+        params = None,
+        optim_states = None,
         lens = None  # (b,)
     ):
-        return state
+        batch, time = state.shape[:2]
+        steps = self.update_steps
+
+        if not exists(params):
+            params = self.policy.init_params(batch)
+
+        if not exists(optim_states):
+            optim_states = self.policy_optimizer.init_optim_states(params)
+
+        chunks = zip(
+            state.split(steps, dim = 1),
+            actions.split(steps, dim = 1),
+            rewards.split(steps, dim = 1),
+            terminated.split(steps, dim = 1)
+        )
+
+        all_target_action_logits = []
+        all_loss_weights = []
+
+        hiddens = None
+
+        for ind, (state_chunk, actions_chunk, rewards_chunk, terminated_chunk) in enumerate(chunks, start = 1):
+
+            policy_output = self.policy(state_chunk, params = params, actions = actions_chunk)
+
+            embeds = self.shared_meta_embed(
+                actions_chunk,
+                rewards_chunk,
+                terminated_chunk,
+                policy_output.action_logits,
+                policy_output.encoded_observations,
+                policy_output.encoded_actions,
+                policy_output.pred_action_value
+            )
+
+            condition, hiddens = self.meta_rnn(embeds, hiddens)
+
+            meta_network_output = self.meta_network(embeds, condition = condition)
+
+            all_target_action_logits.append(meta_network_output.target_action_logits)
+
+            if exists(meta_network_output.loss_weight):
+                all_loss_weights.append(meta_network_output.loss_weight)
+
+            loss = self.meta_network.loss(policy_output, meta_network_output)
+
+            detach_grads = self.should_detach and divisible_by(ind, self.detach_every)
+
+            optim_states, params = self.policy_optimizer(optim_states, loss, params, detach_grads = detach_grads)
+
+            if detach_grads:
+                hiddens, params, optim_states = detach_tree((hiddens, params, optim_states))
+
+        values = self.meta_value_network(state)
+
+        target_action_logits = cat(all_target_action_logits, dim = 1)
+        loss_weights = cat(all_loss_weights, dim = 1) if all_loss_weights else None
+
+        return DiscoRLOutput(target_action_logits, values, loss_weights)

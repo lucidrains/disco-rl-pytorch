@@ -16,6 +16,8 @@ from torch.func import vmap, grad, functional_call
 from einops import pack, rearrange, repeat
 from einops.layers.torch import Reduce
 
+from torch_einops_utils import tree_map_tensor
+
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
 from x_transformers import Decoder, Encoder
 
@@ -455,6 +457,7 @@ class Adam(Module):
         optim_state,
         loss,
         params,
+        detach_grads = False
     ):
         self.time += 1
 
@@ -474,6 +477,13 @@ class Adam(Module):
             retain_graph = True,
             allow_unused = True
         )
+
+        # maybe detach, for TBPTT
+
+        if detach_grads:
+            grad_values = tree_map_tensor(lambda t: t.detach(), grad_values)
+
+        # back to dict[str, Tensor]
 
         grads = dict(zip(param_names, grad_values))
 
@@ -524,18 +534,20 @@ class Adam(Module):
 class DiscoRL(Module):
     def __init__(
         self,
-        policy: Module,
-        policy_optimizer: Module,
-        meta_network: Module,
-        meta_value_network: Module,
+        policy: Policy | Module,
+        policy_optimizer: Adam | Module,
+        meta_rnn: MetaRNN | Module,
+        meta_network: MetaNetwork | Module,
+        meta_value_network: MetaValue | Module,
     ):
         super().__init__()
 
-        self.meta_network = meta_network
-        self.meta_value_network = meta_value_network
-
         self.policy = policy
         self.policy_optimizer = policy_optimizer
+
+        self.meta_rnn = meta_rnn
+        self.meta_network = meta_network
+        self.meta_value_network = meta_value_network
 
     def forward(
         self,

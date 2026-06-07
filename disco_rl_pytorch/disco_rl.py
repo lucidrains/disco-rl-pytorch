@@ -507,7 +507,7 @@ class Adam(Module):
 
             # update params
 
-            update = unbiased_moment.div(unbiased_variance.sqrt().add(eps))
+            update = unbiased_moment * unbiased_variance.add(eps).rsqrt()
 
             next_params[name] = param - update * lr
 

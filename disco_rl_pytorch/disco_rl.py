@@ -12,6 +12,7 @@ from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
 
 from torch.autograd import grad as torch_grad
 from torch.func import vmap, grad, functional_call
+from torch.distributions import Categorical
 
 from einops import pack, rearrange, repeat
 from einops.layers.torch import Reduce
@@ -44,8 +45,17 @@ MetaNetworkOutput = namedtuple('MetaNetworkOutput', (
 DiscoRLOutput = namedtuple('DiscoRLOutput', (
     'target_action_logits',
     'values',
-    'loss_weights'
-), defaults = (None,))
+    'loss_weights',
+    'params',
+    'optim_states'
+), defaults = (None,) * 3)
+
+DiscoRLLossReturn = namedtuple('DiscoRLLossReturn', (
+    'meta_value_loss',
+    'meta_policy_loss',
+    'meta_regularization_kl_loss',
+    'out'
+))
 
 AdamState = namedtuple('AdamState', (
     'time',
@@ -84,7 +94,7 @@ def gumbel_sample(t, dim = -1, keepdim = False):
 # tensor helpers
 
 def detach_tree(t):
-    return tree_map_tensor(lambda t: t.detach(), t)
+    return tree_map_tensor(lambda t: t.detach().requires_grad_(t.requires_grad), t)
 
 def rescale(t, from_range, to_range, eps = 1e-6):
     from_min, from_max = from_range
@@ -526,7 +536,7 @@ class Population(Module):
 
 # vectorized adam
 
-class Adam(Module):
+class PolicyAdam(Module):
     def __init__(
         self,
         lr = 5e-4,
@@ -629,13 +639,15 @@ class DiscoRL(Module):
     def __init__(
         self,
         policy: Policy | Module,
-        policy_optimizer: Adam | Module,
+        policy_optimizer: PolicyAdam | Module,
         shared_meta_embed: SharedMetaEmbed | Module,
         meta_rnn: MetaRNN | Module,
         meta_network: MetaNetwork | Module,
         meta_value_network: MetaValue | Module,
         update_steps = 10,
         detach_every = 0,
+        gamma = 0.99,
+        eps = 1e-8
     ):
         super().__init__()
 
@@ -647,9 +659,70 @@ class DiscoRL(Module):
         self.meta_network = meta_network
         self.meta_value_network = meta_value_network
 
+        self.rl_trace = RLTrace(gamma = gamma, is_retrace = False)
+        self.eps = eps
+
         self.update_steps = update_steps
         self.detach_every = detach_every
         self.should_detach = detach_every > 0
+
+    def loss(
+        self,
+        state,
+        actions,
+        rewards,
+        terminated,
+        old_log_probs,
+        params = None,
+        ema_params = None,
+        optim_states = None,
+    ):
+        out = self(state, actions, rewards, terminated, params = params, optim_states = optim_states)
+
+        # current policy log probs for vtrace targets
+
+        with torch.no_grad():
+            policy_out = self.policy(state, params = params, actions = actions)
+            current_log_probs = Categorical(logits = policy_out.action_logits).log_prob(actions)
+
+        # vtrace targets
+
+        vtrace_targets = self.rl_trace(
+            values = out.values,
+            rewards = rewards,
+            log_probs = current_log_probs,
+            old_log_probs = old_log_probs,
+            terminated = terminated,
+        )
+
+        # meta value loss
+
+        meta_value_loss = F.mse_loss(out.values, vtrace_targets.detach())
+
+        # meta policy loss
+
+        advantages = (vtrace_targets - out.values).detach()
+        advantages = F.layer_norm(advantages, advantages.shape, eps = self.eps)
+
+        next_policy_out = self.policy(state, params = out.params, actions = actions)
+        next_log_probs = Categorical(logits = next_policy_out.action_logits).log_prob(actions)
+
+        meta_policy_loss = -(next_log_probs * advantages).mean()
+
+        # meta regularization kl loss
+
+        with torch.no_grad():
+            ema_policy_out = self.policy(state, params = ema_params, actions = actions)
+
+        meta_regularization_kl_loss = forward_kl(out.target_action_logits, ema_policy_out.action_logits)
+        meta_policy_loss = meta_policy_loss + meta_regularization_kl_loss
+
+        return DiscoRLLossReturn(
+            meta_value_loss,
+            meta_policy_loss,
+            meta_regularization_kl_loss,
+            out
+        )
 
     def forward(
         self,
@@ -719,4 +792,4 @@ class DiscoRL(Module):
         target_action_logits = cat(all_target_action_logits, dim = 1)
         loss_weights = cat(all_loss_weights, dim = 1) if all_loss_weights else None
 
-        return DiscoRLOutput(target_action_logits, values, loss_weights)
+        return DiscoRLOutput(target_action_logits, values, loss_weights, params, optim_states)

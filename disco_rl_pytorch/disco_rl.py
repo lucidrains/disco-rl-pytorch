@@ -16,10 +16,12 @@ from torch.func import vmap, grad, functional_call
 from einops import pack, rearrange, repeat
 from einops.layers.torch import Reduce
 
-from torch_einops_utils import tree_map_tensor
+from torch_einops_utils import tree_map_tensor, shift_left
 
 from x_mlps_pytorch.normed_mlp import create_mlp, MLP
 from x_transformers import Decoder, Encoder
+
+from assoc_scan import AssocScan
 
 # constants
 
@@ -228,6 +230,71 @@ class FiLM(Module):
 
         scaled = einx.multiply('b n d, b n d', normed, gamma + 1.)
         return einx.add('b n d, b n d', scaled, beta)
+
+# v-trace / retrace
+
+class RLTrace(Module):
+    def __init__(
+        self,
+        gamma = 0.99,
+        lam = 1.,
+        clip_rhos = 1.,
+        clip_trace_weights = 1.,
+        is_retrace = False
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_rhos = clip_rhos
+        self.clip_trace_weights = clip_trace_weights
+        self.scan = AssocScan(reverse = True)
+
+        self.is_retrace = is_retrace
+
+    def forward(
+        self,
+        values,
+        rewards,
+        log_probs,
+        old_log_probs,
+        terminated,
+        next_values = None,
+        next_value = 0.
+    ):
+        not_terminated = 1. - terminated.float()
+
+        log_rhos = log_probs - old_log_probs
+        rhos = log_rhos.exp()
+
+        # trace weights
+
+        trace_weights = rhos.clamp(max = self.clip_trace_weights)
+
+        if self.is_retrace:
+            trace_weights = trace_weights * self.lam
+            trace_weights = shift_left(trace_weights, dim = 1)
+
+        gates = self.gamma * trace_weights * not_terminated
+
+        # values
+
+        assert not (self.is_retrace and not exists(next_values)), 'next_values must be explicitly provided for Retrace'
+
+        if not exists(next_values):
+            next_values = shift_left(values, dim = 1, pad_value = next_value)
+
+        next_values = next_values * not_terminated
+
+        # td errors
+
+        delta_values = rewards + self.gamma * next_values - values
+
+        if not self.is_retrace:
+            delta_values = delta_values * rhos.clamp(max = self.clip_rhos)
+
+        # scan
+
+        return self.scan(gates, delta_values) + values
 
 # meta network(s) related
 

@@ -8,10 +8,11 @@ import einx
 import torch
 import torch.nn.functional as F
 from torch import nn, cat, is_tensor
-from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, RMSNorm
+from torch.nn import Sequential, Linear, Module, ModuleList, LSTM, GRU, RMSNorm
 
 from torch.autograd import grad as torch_grad
 from torch.func import vmap, grad, functional_call
+from torch.utils._pytree import tree_map
 from torch.distributions import Categorical
 
 from einops import pack, rearrange, repeat
@@ -54,8 +55,21 @@ DiscoRLLossReturn = namedtuple('DiscoRLLossReturn', (
     'meta_value_loss',
     'meta_policy_loss',
     'meta_regularization_kl_loss',
+    'meta_entropy_loss',
+    'agent_loss_aux_q',
+    'agent_loss_aux_p',
     'out'
 ))
+
+DiscoRLOutput = namedtuple('DiscoRLOutput', (
+    'target_action_logits',
+    'values',
+    'loss_weights',
+    'params',
+    'optim_states',
+    'agent_loss_aux_q',
+    'agent_loss_aux_p'
+), defaults = (None,) * 5)
 
 AdamState = namedtuple('AdamState', (
     'time',
@@ -359,14 +373,14 @@ class MetaNetwork(Module):
         num_actions,
         dim_abstract_observation,
         dim_abstract_action,
-        lstm_kwargs: dict = dict(),
+        gru_kwargs: dict = dict(),
         adaptive_loss_weight = False,
         loss_weight_range = (1e-2, 10.),
         dim_condition = None
     ):
         super().__init__()
 
-        self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
+        self.rnn = GRU(dim, dim, batch_first = True, **gru_kwargs)
 
         # condition from forward meta-rnn
 
@@ -450,7 +464,7 @@ class MetaRNN(Module):
     def __init__(
         self,
         dim,
-        lstm_kwargs: dict = dict(),
+        gru_kwargs: dict = dict(),
         encoder_pool_kwargs: dict = dict()
     ):
         super().__init__()
@@ -460,7 +474,7 @@ class MetaRNN(Module):
             Reduce('b t d -> 1 1 d', 'mean')
         )
 
-        self.rnn = LSTM(dim, dim, batch_first = True, **lstm_kwargs)
+        self.rnn = GRU(dim, dim, batch_first = True, **gru_kwargs)
 
     def forward(
         self,
@@ -518,6 +532,18 @@ class Population(Module):
         params = self.model.named_parameters()
         return {name: repeat(t, '... -> b ...', b = batch) for name, t in params}
 
+    def reset_params_(self, mask, *param_dicts):
+        if not mask.any():
+            return
+
+        num_reset = mask.sum().item()
+        device = mask.device
+        new_params = tree_map(lambda t: t.to(device), self.init_params(num_reset))
+
+        for k in new_params.keys():
+            for d in param_dicts:
+                d[k][mask] = new_params[k]
+
     def forward(
         self,
         state,
@@ -556,6 +582,15 @@ class PolicyAdam(Module):
         moment = {name: torch.zeros_like(t) for name, t in params.items()}
         variance = {name: torch.zeros_like(t) for name, t in params.items()}
         return AdamState(0, moment, variance)
+
+    def reset_optim_states_(self, mask, optim_states):
+        if not mask.any():
+            return
+
+        _, moments, variances = optim_states
+        for k in moments.keys():
+            moments[k][mask] = 0.
+            variances[k][mask] = 0.
 
     def forward(
         self,
@@ -660,6 +695,7 @@ class DiscoRL(Module):
         self.meta_value_network = meta_value_network
 
         self.rl_trace = RLTrace(gamma = gamma, is_retrace = False)
+        self.q_retrace = RLTrace(gamma = gamma, is_retrace = True)
         self.eps = eps
 
         self.update_steps = update_steps
@@ -669,6 +705,7 @@ class DiscoRL(Module):
     def loss(
         self,
         state,
+        next_state,
         actions,
         rewards,
         terminated,
@@ -677,7 +714,7 @@ class DiscoRL(Module):
         ema_params = None,
         optim_states = None,
     ):
-        out = self(state, actions, rewards, terminated, params = params, optim_states = optim_states)
+        out = self(state, next_state, actions, rewards, terminated, old_log_probs, params = params, optim_states = optim_states)
 
         # current policy log probs for vtrace targets
 
@@ -687,12 +724,15 @@ class DiscoRL(Module):
 
         # vtrace targets
 
+        next_values = self.meta_value_network(next_state)
+
         vtrace_targets = self.rl_trace(
             values = out.values,
             rewards = rewards,
             log_probs = current_log_probs,
             old_log_probs = old_log_probs,
             terminated = terminated,
+            next_values = next_values
         )
 
         # meta value loss
@@ -715,21 +755,34 @@ class DiscoRL(Module):
             ema_policy_out = self.policy(state, params = ema_params, actions = actions)
 
         meta_regularization_kl_loss = forward_kl(out.target_action_logits, ema_policy_out.action_logits)
-        meta_policy_loss = meta_policy_loss + meta_regularization_kl_loss
+
+        # entropy loss for the predictions
+
+        meta_entropy_loss = (
+            Categorical(logits = next_policy_out.encoded_observations).entropy().mean() +
+            Categorical(logits = next_policy_out.encoded_actions).entropy().mean()
+        )
+
+        meta_policy_loss = meta_policy_loss + meta_regularization_kl_loss - meta_entropy_loss
 
         return DiscoRLLossReturn(
             meta_value_loss,
             meta_policy_loss,
             meta_regularization_kl_loss,
+            meta_entropy_loss,
+            out.agent_loss_aux_q,
+            out.agent_loss_aux_p,
             out
         )
 
     def forward(
         self,
         state,
+        next_state,
         actions,
         rewards,
         terminated,
+        old_log_probs,
         params = None,
         optim_states = None,
         lens = None  # (b,)
@@ -743,21 +796,52 @@ class DiscoRL(Module):
         if not exists(optim_states):
             optim_states = self.policy_optimizer.init_optim_states(params)
 
-        chunks = zip(
+        chunks = list(zip(
             state.split(steps, dim = 1),
+            next_state.split(steps, dim = 1),
             actions.split(steps, dim = 1),
             rewards.split(steps, dim = 1),
-            terminated.split(steps, dim = 1)
-        )
-
+            terminated.split(steps, dim = 1),
+            old_log_probs.split(steps, dim = 1)
+        ))
         all_target_action_logits = []
         all_loss_weights = []
 
         hiddens = None
+        avg_loss_aux_q = 0.
+        avg_loss_aux_p = 0.
+        num_chunks = len(chunks)
 
-        for ind, (state_chunk, actions_chunk, rewards_chunk, terminated_chunk) in enumerate(chunks, start = 1):
+        for ind, (state_chunk, next_state_chunk, actions_chunk, rewards_chunk, terminated_chunk, old_log_probs_chunk) in enumerate(chunks, start = 1):
 
             policy_output = self.policy(state_chunk, params = params, actions = actions_chunk)
+
+            with torch.no_grad():
+                next_policy_out, _ = self.policy(next_state_chunk, params = params)
+                target_next_action_logits = next_policy_out.detach()
+
+                next_action_probs = target_next_action_logits.softmax(dim=-1)
+
+                expected_next_action_value = 0.
+                for a in range(self.policy.model.num_actions):
+                    test_actions = torch.full_like(actions_chunk, a)
+                    test_out = self.policy(next_state_chunk, params=params, actions=test_actions)
+                    action_value_for_action = rearrange(test_out.pred_action_value, '... 1 -> ...')
+                    expected_next_action_value = expected_next_action_value + next_action_probs[..., a] * action_value_for_action
+
+                next_values = expected_next_action_value.detach()
+
+                action_values = rearrange(policy_output.pred_action_value, '... 1 -> ...').detach()
+                current_log_probs = Categorical(logits = policy_output.action_logits).log_prob(actions_chunk).detach()
+
+                target_action_value = self.q_retrace(
+                    values = action_values,
+                    rewards = rewards_chunk,
+                    log_probs = current_log_probs,
+                    old_log_probs = old_log_probs_chunk,
+                    terminated = terminated_chunk,
+                    next_values = next_values
+                )
 
             embeds = self.shared_meta_embed(
                 actions_chunk,
@@ -780,6 +864,13 @@ class DiscoRL(Module):
 
             loss = self.meta_network.loss(policy_output, meta_network_output)
 
+            loss_aux_action_value = F.mse_loss(rearrange(policy_output.pred_action_value, '... 1 -> ...'), target_action_value)
+            loss_aux_next_action_logits = forward_kl(policy_output.pred_next_action_logits, target_next_action_logits)
+            loss = loss + loss_aux_action_value + loss_aux_next_action_logits
+
+            avg_loss_aux_q = avg_loss_aux_q + loss_aux_action_value.detach() / num_chunks
+            avg_loss_aux_p = avg_loss_aux_p + loss_aux_next_action_logits.detach() / num_chunks
+
             detach_grads = self.should_detach and divisible_by(ind, self.detach_every)
 
             optim_states, params = self.policy_optimizer(optim_states, loss, params, detach_grads = detach_grads)
@@ -792,4 +883,4 @@ class DiscoRL(Module):
         target_action_logits = cat(all_target_action_logits, dim = 1)
         loss_weights = cat(all_loss_weights, dim = 1) if all_loss_weights else None
 
-        return DiscoRLOutput(target_action_logits, values, loss_weights, params, optim_states)
+        return DiscoRLOutput(target_action_logits, values, loss_weights, params, optim_states, loss_aux_action_value, loss_aux_next_action_logits)

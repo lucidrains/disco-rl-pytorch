@@ -55,7 +55,7 @@ def cycle_dl(buffer, batch_size, seq_len):
     while True:
         yield from buffer.dataloader(
             batch_size = batch_size,
-            n_steps = seq_len,
+            n_steps = seq_len + 1,
             sequence_fields = ('state', 'action', 'reward', 'terminated', 'log_prob'),
             shuffle = True,
             drop_last = True
@@ -84,6 +84,7 @@ def main(
     use_wandb: bool = False,
     cpu: bool = False,
     ema_beta: float = 0.99,
+    reset_prob: float = 0.01,
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -192,18 +193,21 @@ def main(
         if buffer.timestep_index < buffer_warmup or not divisible_by(step, train_every):
             continue
 
-        batch = next(dl)
+        batch = tree_map(lambda t: t.to(device), next(dl))
 
-        states = batch['seq_state'].float().to(device)
-        actions = batch['seq_action'].long().to(device)
-        rewards = batch['seq_reward'].float().to(device)
-        terminals = batch['seq_terminated'].bool().to(device)
-        old_log_probs = batch['seq_log_prob'].float().to(device)
+        seq_state = batch['seq_state'].float()
+        states, next_states = seq_state[:, :-1], seq_state[:, 1:]
+
+        actions = batch['seq_action'][:, :-1].long()
+        rewards = batch['seq_reward'][:, :-1].float()
+        terminals = batch['seq_terminated'][:, :-1].bool()
+        old_log_probs = batch['seq_log_prob'][:, :-1].float()
 
         meta_optimizer.zero_grad()
 
         loss_return = discorl.loss(
             state = states,
+            next_state = next_states,
             actions = actions,
             rewards = rewards,
             terminated = terminals,
@@ -224,6 +228,12 @@ def main(
 
         with torch.no_grad():
 
+            # randomly reset a subset of agents in the population
+            mask = torch.rand(batch_size, device = device) < reset_prob
+
+            policy.reset_params_(mask, params, ema_params)
+            discorl.policy_optimizer.reset_optim_states_(mask, optim_states)
+
             # update ema params
             for e, p in zip(ema_params.values(), params.values()):
                 e.lerp_(p, 1. - ema_beta)
@@ -238,6 +248,9 @@ def main(
                 meta_value_loss = loss_return.meta_value_loss.item(),
                 meta_policy_loss = loss_return.meta_policy_loss.item(),
                 meta_kl_loss = loss_return.meta_regularization_kl_loss.item(),
+                meta_entropy_loss = loss_return.meta_entropy_loss.item(),
+                agent_loss_aux_action_value = loss_return.agent_loss_aux_q.item(),
+                agent_loss_aux_next_action_logits = loss_return.agent_loss_aux_p.item(),
                 meta_loss = meta_loss.item(),
             ))
 

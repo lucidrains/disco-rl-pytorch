@@ -3,6 +3,7 @@ parametrize = pytest.mark.parametrize
 
 import torch
 import torch.nn.functional as F
+from torch.utils._pytree import tree_map
 
 @parametrize('adaptive_loss_weight', (True, False))
 def test_components(adaptive_loss_weight):
@@ -13,7 +14,7 @@ def test_components(adaptive_loss_weight):
         MetaValue,
         Policy,
         Population,
-        Adam,
+        PolicyAdam,
         forward_kl,
         PolicyOutput
     )
@@ -61,7 +62,7 @@ def test_components(adaptive_loss_weight):
 
     loss = meta_network.loss(policy_outputs, meta_network_outputs)
 
-    population_optimizer = Adam()
+    population_optimizer = PolicyAdam()
 
     optim_states = population_optimizer.init_optim_states(params)
 
@@ -85,7 +86,7 @@ def test_disco_rl(adaptive_loss_weight):
         MetaValue,
         Policy,
         Population,
-        Adam,
+        PolicyAdam,
         DiscoRL
     )
 
@@ -101,7 +102,7 @@ def test_disco_rl(adaptive_loss_weight):
         dim_abstract_observation = 32,
         adaptive_loss_weight = adaptive_loss_weight
     )
-    population_optimizer = Adam()
+    population_optimizer = PolicyAdam()
     value_network = MetaValue(dim = 32, dim_state = 8, depth = 4)
 
     disco_rl = DiscoRL(
@@ -115,11 +116,26 @@ def test_disco_rl(adaptive_loss_weight):
     )
 
     states = torch.randn(7, 20, 8)
+    next_states = torch.randn(7, 20, 8)
     actions = torch.randint(0, 4, (7, 20))
     rewards = torch.randn(7, 20)
     terminated = torch.zeros(7, 20).bool()
+    old_log_probs = torch.randn(7, 20)
 
-    output = disco_rl(states, actions, rewards, terminated)
+    params = population.init_params(7)
+    ema_params = tree_map(lambda t: t.clone(), params)
+    optim_states = population_optimizer.init_optim_states(params)
+
+    output = disco_rl(
+        state = states,
+        next_state = next_states,
+        actions = actions,
+        rewards = rewards,
+        terminated = terminated,
+        old_log_probs = old_log_probs,
+        params = params,
+        optim_states = optim_states
+    )
 
     assert output.target_action_logits.shape == (7, 20, 4)
     assert output.values.shape == (7, 20)
@@ -128,3 +144,21 @@ def test_disco_rl(adaptive_loss_weight):
         assert output.loss_weights.shape == (7, 20, 3)
     else:
         assert output.loss_weights is None
+
+    # Test loss calculation
+    loss_return = disco_rl.loss(
+        state = states,
+        next_state = next_states,
+        actions = actions,
+        rewards = rewards,
+        terminated = terminated,
+        old_log_probs = old_log_probs,
+        params = params,
+        ema_params = ema_params,
+        optim_states = optim_states
+    )
+
+    assert loss_return.meta_value_loss.numel() == 1
+    assert loss_return.meta_policy_loss.numel() == 1
+    assert loss_return.meta_regularization_kl_loss.numel() == 1
+    assert loss_return.meta_entropy_loss.numel() == 1

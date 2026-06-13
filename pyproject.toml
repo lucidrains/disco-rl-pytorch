@@ -1,6 +1,6 @@
 [project]
 name = "disco-rl-pytorch"
-version = "0.0.4"
+version = "0.0.5"
 description = "Implementation of DiscoRL, Discovering state-of-the-art reinforcement learning algorithms"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
